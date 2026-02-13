@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import random
 import re
+import requests
 from datetime import datetime
 import theme_analog_warmth as theme
 
@@ -22,6 +23,22 @@ DEFAULT_INDUSTRY_TURN = {
     'kia_sportage': 56, 'genesis_gv70': 36, 'genesis_g70': 42
 }
 
+# Extensive Make/Model database for dropdowns
+VEHICLE_DB = {
+    "Chevrolet": ["Silverado 1500", "Equinox", "Malibu", "Tahoe", "Traverse", "Colorado", "Trax", "Suburban"],
+    "Ford": ["F-150", "Escape", "Explorer", "Edge", "Mustang", "Bronco", "Ranger", "Expedition"],
+    "Honda": ["Accord", "Civic", "CR-V", "Pilot", "Odyssey", "HR-V", "Ridgeline"],
+    "Hyundai": ["Tucson", "Elantra", "Sonata", "Santa Fe", "Palisade", "Kona", "Venue"],
+    "Kia": ["Sportage", "Sorento", "Telluride", "Optima", "K5", "Forte", "Soul", "Carnival"],
+    "Nissan": ["Rogue", "Altima", "Sentra", "Pathfinder", "Frontier", "Murano", "Kicks"],
+    "Toyota": ["Camry", "RAV4", "Corolla", "Highlander", "Tacoma", "Tundra", "4Runner", "Sienna"],
+    "Genesis": ["G70", "G80", "G90", "GV70", "GV80"],
+    "Jeep": ["Grand Cherokee", "Wrangler", "Cherokee", "Compass", "Gladiator"],
+    "Subaru": ["Outback", "Forester", "Crosstrek", "Ascent", "Impreza", "Legacy"],
+    "Volkswagen": ["Jetta", "Tiguan", "Atlas", "Taos", "Golf"],
+    "Other": ["Other Model"]
+}
+
 BASE_MSRP = {
     'hyundai_tucson': 26000, 'hyundai_elantra': 21000, 'hyundai_sonata': 25000,
     'nissan_rogue': 28000, 'nissan_altima': 25000, 'toyota_camry': 27000,
@@ -29,28 +46,17 @@ BASE_MSRP = {
     'genesis_gv70': 45000, 'chevrolet_equinox': 26000, 'ford_escape': 27000
 }
 
-WMI_MAPPING = {
-    '1G': 'Chevrolet', '2G': 'Chevrolet', '3G': 'Chevrolet',
-    '1H': 'Honda', '2H': 'Honda', '3H': 'Honda', 'JH': 'Honda',
-    '1N': 'Nissan', '3N': 'Nissan', 'JN': 'Nissan',
-    '1T': 'Toyota', '2T': 'Toyota', '3T': 'Toyota', '4T': 'Toyota', '5T': 'Toyota', 'JT': 'Toyota',
-    'KM8': 'Hyundai', 'KMH': 'Hyundai', '5NM': 'Hyundai',
-    'KN': 'Kia', '5X': 'Kia',
-    '1F': 'Ford', '2F': 'Ford', '3F': 'Ford', '4F': 'Ford',
-    'KMT': 'Genesis'
-}
-
-YEAR_CODES = {'J': 2018, 'K': 2019, 'L': 2020, 'M': 2021, 'N': 2022, 'P': 2023, 'R': 2024, 'S': 2025, 'T': 2026}
-
 # ---------------------------------------------------------
 # SESSION STATE
 # ---------------------------------------------------------
-if 'dealer_turn_data' not in st.session_state:
-    st.session_state.dealer_turn_data = {}
-if 'dealer_gross_data' not in st.session_state:
-    st.session_state.dealer_gross_data = {}
-if 'sales_summary' not in st.session_state:
-    st.session_state.sales_summary = None
+if 'dealer_turn_data' not in st.session_state: st.session_state.dealer_turn_data = {}
+if 'dealer_gross_data' not in st.session_state: st.session_state.dealer_gross_data = {}
+if 'sales_summary' not in st.session_state: st.session_state.sales_summary = None
+
+# VIN Decoder State
+if 'dec_make' not in st.session_state: st.session_state.dec_make = "Kia"
+if 'dec_model' not in st.session_state: st.session_state.dec_model = "Sportage"
+if 'dec_year' not in st.session_state: st.session_state.dec_year = 2020
 
 # ---------------------------------------------------------
 # HELPER FUNCTIONS
@@ -59,19 +65,14 @@ def parse_currency(val):
     if pd.isna(val): return 0.0
     val_str = str(val).strip()
     if not val_str or val_str == '-': return 0.0
-    
     is_neg = False
     if val_str.startswith('(') and val_str.endswith(')'):
         is_neg, val_str = True, val_str[1:-1]
     elif val_str.startswith('-'):
         is_neg, val_str = True, val_str[1:]
-        
     val_str = re.sub(r'[^\d.]', '', val_str)
-    try:
-        parsed = float(val_str)
-        return -parsed if is_neg else parsed
-    except ValueError:
-        return 0.0
+    try: return -float(val_str) if is_neg else float(val_str)
+    except ValueError: return 0.0
 
 def get_base_cpm(price):
     if price < 15000: return 0.10
@@ -95,16 +96,69 @@ def get_priority(turn_days, margin):
     if turn_days >= 60 and margin < 0.08: return "LOW"
     return "MEDIUM"
 
-def decode_vin(vin):
-    vin = vin.upper()
-    if len(vin) != 17 or any(c in vin for c in 'IOQ'): return "", CURRENT_YEAR - 3
-    make = "Unknown"
-    for wmi, m in WMI_MAPPING.items():
-        if vin.startswith(wmi):
-            make = m
-            break
-    year = YEAR_CODES.get(vin[9], CURRENT_YEAR - 3)
-    return make, year
+@st.cache_data(show_spinner=False)
+def decode_vin_nhtsa(vin):
+    """Pings the free US Govt NHTSA API to fully decode Make, Model, and Year"""
+    if len(vin) != 17 or any(c in vin for c in 'IOQ'): return "", "", CURRENT_YEAR - 3
+    try:
+        url = f"https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues/{vin}?format=json"
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200:
+            data = response.json()['Results'][0]
+            make = data.get('Make', '').title()
+            model = data.get('Model', '').title()
+            try: year = int(data.get('ModelYear', ''))
+            except ValueError: year = CURRENT_YEAR - 3
+            return make, model, year
+    except Exception: pass
+    return "", "", CURRENT_YEAR - 3
+
+def generate_vauto_market_data(make, model, year, target_mileage, radius, zip_code):
+    """
+    FUTURE API PLUG-IN: Replace this mock logic with a call to MarketCheck API.
+    Example: requests.get(f"https://api.marketcheck.com/v2/search/car/active?api_key=YOUR_KEY...")
+    """
+    key = f"{str(make).lower()}_{str(model).lower().replace(' ', '_')}"
+    base_price = BASE_MSRP.get(key, 25000) * (0.85 ** max(0, CURRENT_YEAR - year))
+    
+    # Generate 15 to 30 simulated live listings within the radius
+    random.seed(f"{make}{model}{year}{zip_code}")
+    num_listings = random.randint(18, 35) 
+    rad_int = int(radius.replace(" miles", ""))
+    
+    sellers = ["SUN STATE FORD", "MAZDA OF WESLEY...", "GETTEL STADIUM...", "Prime Leasing and Sales", "CAR SELECT LLC", "Universal Nissan", "OFFLEASE ORLANDO", "C & L MOTORS"]
+    colors = ["Blue", "Black", "Gray", "Silver", "White", "Red"]
+    interiors = ["Black Cloth", "Gray Cloth", "Black Leather", "Beige Leather"]
+    
+    listings = []
+    for i in range(num_listings):
+        price_var = random.gauss(0, 1500)
+        mileage_var = random.gauss(0, 15000)
+        dist = random.randint(0, rad_int)
+        
+        listings.append({
+            "Vehicle": f"{year} {make} {model}",
+            "Color": random.choice(colors),
+            "Interior": random.choice(interiors),
+            "List Price": max(4000, int(base_price - ((target_mileage + mileage_var - target_mileage) * 0.08) + price_var)),
+            "Odometer (mi)": max(1000, int(target_mileage + mileage_var)),
+            "Age": int(abs(random.gauss(45, 30))),
+            "Distance (mi)": dist,
+            "Seller": random.choice(sellers),
+            "VDP": "🔗 Link"
+        })
+    
+    df = pd.DataFrame(listings)
+    # Sort by price ascending to match vAuto default Rank
+    df = df.sort_values(by="List Price", ascending=True).reset_index(drop=True)
+    df.insert(0, "Rank", df.index + 1)
+    
+    # Randomize vRank (vAuto's proprietary value rank)
+    v_ranks = list(range(1, len(df) + 1))
+    random.shuffle(v_ranks)
+    df.insert(1, "vRank", v_ranks)
+    
+    return df
 
 # ---------------------------------------------------------
 # SIDEBAR SETTINGS
@@ -124,16 +178,6 @@ with st.sidebar:
     manual_cpm = 0.15
     if not auto_cpm:
         manual_cpm = st.slider("Manual CPM", 0.05, 0.50, 0.15, step=0.01)
-    else:
-        st.markdown("""
-        <div style="font-size: 0.85rem; background-color: rgba(255,255,255,0.1); padding: 8px; border-radius: 4px;">
-        <b>Tier Breakdown:</b><br>
-        Budget (&lt;$15k): $0.10/mi<br>
-        Mainstream ($15k-$45k): $0.15/mi<br>
-        Luxury ($45k-$80k): $0.20/mi<br>
-        High-Line ($80k+): $0.30/mi
-        </div><br>
-        """, unsafe_allow_html=True)
 
     st.markdown(f"**Buy Fees:** ${BUY_FEES}")
     
@@ -147,15 +191,118 @@ with st.sidebar:
 # ---------------------------------------------------------
 # MAIN APP TABS
 # ---------------------------------------------------------
-tab1, tab2, tab3 = st.tabs(["Sales Performance", "Single VIN Lookup", "Batch Processor"])
+tab1, tab2, tab3 = st.tabs(["Single VIN Lookup", "Sales Performance", "Batch Processor"])
 
-# TAB 1: SALES PERFORMANCE (DATA UPLOAD)
+# TAB 2 IS NOW TAB 1: SINGLE VIN LOOKUP (VAUTO OVERHAUL)
 with tab1:
+    st.header("Single VIN Appraisal")
+    
+    # VIN Input & Decode logic
+    vin_col, zip_col = st.columns([3, 1])
+    vin_input = vin_col.text_input("VIN (17 characters) - Live NHTSA Decoding", max_chars=17).upper()
+    zip_code = zip_col.text_input("Origin Zip Code", value="32801")
+    
+    if vin_input and len(vin_input) == 17:
+        with st.spinner("Decoding via US Govt Database..."):
+            d_make, d_model, d_year = decode_vin_nhtsa(vin_input)
+            if d_make:
+                st.session_state.dec_make = d_make
+                st.session_state.dec_model = d_model
+                st.session_state.dec_year = d_year
+                st.success(f"Decoded: {d_year} {d_make} {d_model}")
+            else:
+                st.error("Invalid VIN or not found in NHTSA database.")
+                
+    c1, c2, c3, c4 = st.columns(4)
+    
+    # Make Dropdown logic
+    makes_list = list(VEHICLE_DB.keys())
+    if st.session_state.dec_make not in makes_list: makes_list.append(st.session_state.dec_make)
+    make_idx = makes_list.index(st.session_state.dec_make) if st.session_state.dec_make in makes_list else 0
+    make_input = c1.selectbox("Make", makes_list, index=make_idx)
+    
+    # Model Dropdown logic
+    models_list = VEHICLE_DB.get(make_input, [])
+    if st.session_state.dec_model not in models_list: models_list.insert(0, st.session_state.dec_model)
+    if not models_list: models_list = ["Other Model"]
+    model_input = c2.selectbox("Model", models_list)
+    
+    year_input = c3.number_input("Year", min_value=1980, max_value=2030, value=st.session_state.dec_year)
+    mileage_input = c4.number_input("Mileage", min_value=0, step=1000, value=50000)
+    
+    rad = st.selectbox("Market Search Radius", ["25 miles", "50 miles", "100 miles", "200 miles"], index=1)
+    
+    if st.button("Search Market", type="primary"):
+        if not make_input or not model_input:
+            st.warning("Please fill Make and Model.")
+        else:
+            # Fetch simulated data to match vAuto format
+            df_mkt = generate_vauto_market_data(make_input, model_input, year_input, mileage_input, rad, zip_code)
+            
+            market_avg_price = df_mkt["List Price"].mean()
+            market_median_mileage = df_mkt["Odometer (mi)"].median()
+            avg_dom = df_mkt["Age"].mean()
+            
+            cpm = calculate_cpm(market_avg_price, year_input, CURRENT_YEAR, auto_cpm, manual_cpm)
+            mileage_impact = (market_median_mileage - mileage_input) * cpm
+            adjusted_retail = market_avg_price + mileage_impact
+            max_buy = (adjusted_retail * (1 - margin_target)) - recon_cost - BUY_FEES
+            
+            st.markdown("---")
+            
+            # VAUTO STYLE METRICS OVERVIEW
+            col_target, col_market, col_books = st.columns([1.2, 1.8, 1])
+            
+            with col_target:
+                st.markdown("### Pricing Analysis")
+                st.metric("Recommended Max Buy", f"${max_buy:,.0f}")
+                st.write(f"Adjusted Retail: **${adjusted_retail:,.0f}**")
+                st.write(f"Recon & Fees: **-${recon_cost + BUY_FEES:,.0f}**")
+                st.write(f"Target Margin: **{margin_target*100:.0f}%**")
+                st.caption(f"Used CPM: ${cpm:.3f}/mi")
+                
+            with col_market:
+                st.markdown("### Market Overview")
+                mc1, mc2, mc3 = st.columns(3)
+                
+                price_diff = market_avg_price - adjusted_retail
+                mc1.metric("Avg. Price", f"${market_avg_price:,.0f}", f"${abs(price_diff):,.0f} {'below' if price_diff > 0 else 'above'}", delta_color="inverse")
+                
+                odo_diff = market_median_mileage - mileage_input
+                mc2.metric("Avg. Odometer", f"{market_median_mileage:,.0f}", f"{abs(odo_diff):,.0f} mi. {'above' if odo_diff > 0 else 'below'}", delta_color="inverse")
+                
+                mc3.metric("Mkt. Days Supply", f"{int(avg_dom)}", "Overall | Like Mine")
+                
+            with col_books:
+                st.markdown("### Books (Est.)")
+                st.write(f"Black Book: **${market_avg_price * 0.92:,.0f}**")
+                st.write(f"KBB.com: **${market_avg_price * 1.05:,.0f}**")
+                st.write(f"MMR: **${market_avg_price * 0.88:,.0f}**")
+
+            st.markdown("---")
+            
+            # VAUTO STYLE COMPETITIVE SET TABLE
+            st.markdown(f"### Competitive Set ({len(df_mkt)} Vehicles)")
+            
+            # Format dataframe for clean display with HTML for Color/Interior
+            df_disp = df_mkt.copy()
+            df_disp["Vehicle"] = df_disp["Vehicle"] + "<br><span style='font-size: 0.8em; color: gray;'>Color: " + df_disp["Color"] + " | Interior: " + df_disp["Interior"] + "</span>"
+            df_disp["List Price"] = df_disp["List Price"].apply(lambda x: f"${x:,.0f}")
+            df_disp["Odometer (mi)"] = df_disp["Odometer (mi)"].apply(lambda x: f"{x:,.0f}")
+            
+            df_disp = df_disp[["Rank", "vRank", "Vehicle", "List Price", "Odometer (mi)", "Age", "Distance (mi)", "Seller", "VDP"]]
+            
+            # To render the HTML inside the dataframe correctly in Streamlit, we must use to_html
+            st.markdown(df_disp.to_html(escape=False, index=False), unsafe_allow_html=True)
+
+
+# TAB 2: SALES PERFORMANCE (DATA UPLOAD)
+with tab2:
     st.header("Sales Performance Data")
     st.markdown("""
     <div class="info-box">
     Upload your dealer's DMS sales log (CSV or Excel) to extract custom turn rates and gross averages by Make/Model. 
-    The logic engine will automatically apply your proprietary data to Tab 2 and Tab 3.
+    The logic engine will automatically apply your proprietary data.
     </div>
     """, unsafe_allow_html=True)
     
@@ -178,7 +325,7 @@ with tab1:
             missing = [c for c in req_cols if c not in df.columns]
             
             if missing:
-                st.error(f"Missing expected columns: {', '.join(missing)}. Make sure the upload contains all standard columns.")
+                st.error(f"Missing expected columns: {', '.join(missing)}")
             else:
                 df = df[df['Deal Type'].astype(str).str.upper() == 'RETAIL'].copy()
                 df = df.dropna(subset=['Sold Date', 'Received Date'])
@@ -238,100 +385,7 @@ with tab1:
         disp_df = ss['breakdown'].copy()
         disp_df['Avg_Turn'] = disp_df['Avg_Turn'].apply(lambda x: f"{x:.0f}d")
         for col in ['Avg_Front_Gross', 'Avg_Total_Gross']: disp_df[col] = disp_df[col].apply(lambda x: f"${x:,.2f}")
-        
         st.markdown(disp_df.to_html(index=False), unsafe_allow_html=True)
-
-
-# TAB 2: SINGLE VIN LOOKUP
-with tab2:
-    st.header("Single VIN Appraisal")
-    
-    vin_input = st.text_input("VIN (17 characters)", max_chars=17).upper()
-    d_make, d_year = "", CURRENT_YEAR
-    
-    if vin_input:
-        if len(vin_input) == 17 and not any(c in vin_input for c in 'IOQ'):
-            d_make, d_year = decode_vin(vin_input)
-        else:
-            st.warning("VIN must be 17 characters and cannot contain I, O, or Q.")
-            
-    c1, c2, c3, c4 = st.columns(4)
-    make_input = c1.text_input("Make", value=d_make)
-    model_input = c2.text_input("Model")
-    year_input = c3.number_input("Year", min_value=1980, max_value=2030, value=d_year)
-    mileage_input = c4.number_input("Mileage", min_value=0, step=1000, value=50000)
-    
-    rad = st.selectbox("Search Radius", ["25 miles", "50 miles", "100 miles", "200 miles"], index=1)
-    
-    if st.button("Search Market", type="primary"):
-        if not make_input or not model_input:
-            st.warning("Please fill Make and Model.")
-        else:
-            random.seed(f"{vin_input}{make_input}{model_input}{year_input}")
-            key = f"{str(make_input).lower()}_{str(model_input).lower().replace(' ', '_')}"
-            base_price = BASE_MSRP.get(key, 25000) * (0.85 ** max(0, CURRENT_YEAR - year_input))
-            
-            listings = []
-            for i in range(10):
-                listings.append({
-                    "Dealer": f"Competitor {i+1}",
-                    "City": random.choice(["Local City", "Neighboring Town", "Metro Area"]),
-                    "Price": max(5000, base_price + random.randint(-3000, 3000)),
-                    "Mileage": max(1000, mileage_input + random.randint(-20000, 20000)),
-                    "DOM": random.randint(5, 100),
-                    "Certified": random.choice(["Yes", "No"])
-                })
-            df_mkt = pd.DataFrame(listings)
-            
-            market_avg_price = df_mkt["Price"].mean()
-            market_median_mileage = df_mkt["Mileage"].median()
-            
-            cpm = calculate_cpm(market_avg_price, year_input, CURRENT_YEAR, auto_cpm, manual_cpm)
-            mileage_impact = (market_median_mileage - mileage_input) * cpm
-            adjusted_retail = market_avg_price + mileage_impact
-            max_buy = (adjusted_retail * (1 - margin_target)) - recon_cost - BUY_FEES
-            
-            turn_days, source = get_turn_days(make_input, model_input)
-            
-            if margin_target >= 0.12 and turn_days <= 45:
-                st.markdown('<div class="banner-success">AGGRESSIVE BUY</div>', unsafe_allow_html=True)
-            elif margin_target < 0.08 or turn_days > 60:
-                st.markdown('<div class="banner-error">PASS OR RENEGOTIATE</div>', unsafe_allow_html=True)
-            else:
-                st.markdown('<div class="banner-warning">PROCEED WITH CAUTION</div>', unsafe_allow_html=True)
-            
-            alert = "100K+ CLIFF" if mileage_input >= 100000 else "NEAR 100K" if mileage_input >= 95000 else ""
-            if alert: st.markdown(theme.alert_badge(alert), unsafe_allow_html=True)
-            
-            col_a, col_b, col_c = st.columns(3)
-            with col_a:
-                st.subheader("Ceiling Bid")
-                st.metric("Max Buy Price", f"${max_buy:,.2f}")
-                with st.expander("Show Logic Breakdown"):
-                    st.write(f"Adjusted Retail: **${adjusted_retail:,.2f}**")
-                    st.write(f"- Margin Target ({margin_target*100:.1f}%): **-${adjusted_retail*margin_target:,.2f}**")
-                    st.write(f"- Recon Cost: **-${recon_cost:,.2f}**")
-                    st.write(f"- Buy Fees: **-${BUY_FEES:,.2f}**")
-            with col_b:
-                st.subheader("Mileage Analysis")
-                st.metric("Mileage Impact", f"${mileage_impact:,.2f}")
-                st.write(f"Your Mileage: **{mileage_input:,}**")
-                st.write(f"Market Median: **{market_median_mileage:,.0f}**")
-                st.write(f"CPM Used: **${cpm:.3f}/mi**")
-            with col_c:
-                st.subheader("Market Intel")
-                ds_display = f"YOUR Data" if source == "YOUR Data" else f"Industry Avg"
-                st.metric("Turn Days", f"{turn_days:.0f}d", help=f"Source: {ds_display}")
-                st.write(f"Listing Count: **10**")
-                st.write(f"Avg DOM: **{df_mkt['DOM'].mean():.0f}d**")
-                st.write(f"Price Range: **${df_mkt['Price'].min():,.0f} - ${df_mkt['Price'].max():,.0f}**")
-                
-            st.markdown("#### Competitor Listings")
-            df_disp = df_mkt.copy()
-            df_disp['Price'] = df_disp['Price'].apply(lambda x: f"${x:,.2f}")
-            df_disp['Mileage'] = df_disp['Mileage'].apply(lambda x: f"{x:,.0f}")
-            df_disp['DOM'] = df_disp['DOM'].apply(lambda x: f"{x}d")
-            st.markdown(df_disp.to_html(index=False), unsafe_allow_html=True)
 
 
 # TAB 3: BATCH PROCESSOR
@@ -413,7 +467,6 @@ with tab3:
             c6.metric("Total Front Gross", f"${res_df['_raw_front'].sum():,.2f}")
             c7.metric("Avg Front Margin %", f"{res_df['Front Margin'].mean()*100:.1f}%")
             
-            # Format Data for Display
             disp_df = res_df.drop(columns=['_raw_mi', '_raw_front', 'Total Deal']).copy()
             disp_df['Priority'] = disp_df['Priority'].apply(theme.priority_badge)
             disp_df['Alert'] = disp_df['Alert'].apply(theme.alert_badge)
@@ -429,7 +482,6 @@ with tab3:
             st.markdown("### Results Table")
             st.markdown(disp_df.to_html(escape=False, index=False), unsafe_allow_html=True)
             
-            # Raw CSV data for download
             csv_df = res_df.drop(columns=['_raw_mi', '_raw_front'])
             csv_df['Turn Days'] = csv_df['Turn Days'].apply(lambda x: f"{x:.0f}d")
             csv_df['Front Margin'] = csv_df['Front Margin'].apply(lambda x: f"{x*100:.1f}%")
